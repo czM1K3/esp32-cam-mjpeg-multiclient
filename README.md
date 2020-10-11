@@ -10,7 +10,7 @@ This code is originally from [arkhipenko/esp32-cam-mjpeg-multiclient](https://gi
     * M5STACK WITH PSRAM
     * M5STACK WIDE
     * WROVER KIT
-    * CAMERA_MODEL_ESP_EYE
+    * ESP EYE
 * Programmer (I used [CP2102](https://www.aliexpress.com/item/33039615015.html))
 * Dupont female to female cables (at least 5)
 * IDE that supports PlatformIO (VSCode, Atom and [more](https://docs.platformio.org/en/latest/integration/ide/index.html?highlight=ide#desktop-ide)) or only PlatformIO Core
