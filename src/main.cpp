@@ -24,7 +24,7 @@
 #define APP_CPU 1
 #define PRO_CPU 0
 
-#include "src/OV2640.h"
+#include "OV2640.cpp"
 #include <WiFi.h>
 #include <WebServer.h>
 #include <WiFiClient.h>
@@ -34,28 +34,10 @@
 #include <esp_sleep.h>
 #include <driver/rtc_io.h>
 
-// Select camera model
-//#define CAMERA_MODEL_WROVER_KIT
-#define CAMERA_MODEL_ESP_EYE
-//#define CAMERA_MODEL_M5STACK_PSRAM
-//#define CAMERA_MODEL_M5STACK_WIDE
-//#define CAMERA_MODEL_AI_THINKER
+#include "configuration.h"
 
 #include "camera_pins.h"
 
-/*
-  Next one is an include with wifi credentials.
-  This is what you need to do:
-
-  1. Create a file called "home_wifi_multi.h" in the same folder   OR   under a separate subfolder of the "libraries" folder of Arduino IDE. (You are creating a "fake" library really - I called it "MySettings").
-  2. Place the following text in the file:
-  #define SSID1 "replace with your wifi ssid"
-  #define PWD1 "replace your wifi password"
-  3. Save.
-
-  Should work then
-*/
-#include "home_wifi_multi.h"
 
 OV2640 cam;
 
@@ -74,70 +56,58 @@ SemaphoreHandle_t frameSync = NULL;
 QueueHandle_t streamingClients;
 
 // We will try to achieve 25 FPS frame rate
-const int FPS = 14;
+const int Fps = FPS;
 
 // We will handle web client requests every 50 ms (20 Hz)
 const int WSINTERVAL = 100;
-
-
-// ======== Server Connection Handler Task ==========================
-void mjpegCB(void* pvParameters) {
-  TickType_t xLastWakeTime;
-  const TickType_t xFrequency = pdMS_TO_TICKS(WSINTERVAL);
-
-  // Creating frame synchronization semaphore and initializing it
-  frameSync = xSemaphoreCreateBinary();
-  xSemaphoreGive( frameSync );
-
-  // Creating a queue to track all connected clients
-  streamingClients = xQueueCreate( 10, sizeof(WiFiClient*) );
-
-  //=== setup section  ==================
-
-  //  Creating RTOS task for grabbing frames from the camera
-  xTaskCreatePinnedToCore(
-    camCB,        // callback
-    "cam",        // name
-    4096,         // stacj size
-    NULL,         // parameters
-    2,            // priority
-    &tCam,        // RTOS task handle
-    APP_CPU);     // core
-
-  //  Creating task to push the stream to all connected clients
-  xTaskCreatePinnedToCore(
-    streamCB,
-    "strmCB",
-    4 * 1024,
-    NULL, //(void*) handler,
-    2,
-    &tStream,
-    APP_CPU);
-
-  //  Registering webserver handling routines
-  server.on("/mjpeg/1", HTTP_GET, handleJPGSstream);
-  server.on("/jpg", HTTP_GET, handleJPG);
-  server.onNotFound(handleNotFound);
-
-  //  Starting webserver
-  server.begin();
-
-  //=== loop() section  ===================
-  xLastWakeTime = xTaskGetTickCount();
-  for (;;) {
-    server.handleClient();
-
-    //  After every server client handling request, we let other tasks run and then pause
-    taskYIELD();
-    vTaskDelayUntil(&xLastWakeTime, xFrequency);
-  }
-}
-
 
 // Commonly used variables:
 volatile size_t camSize;    // size of the current frame, byte
 volatile char* camBuf;      // pointer to the current frame
 
+// ==== STREAMING ======================================================
+const char HEADER[] = "HTTP/1.1 200 OK\r\n" \
+                      "Access-Control-Allow-Origin: *\r\n" \
+                      "Content-Type: multipart/x-mixed-replace; boundary=123456789000000000000987654321\r\n";
+const char BOUNDARY[] = "\r\n--123456789000000000000987654321\r\n";
+const char CTNTTYPE[] = "Content-Type: image/jpeg\r\nContent-Length: ";
+const int hdrLen = strlen(HEADER);
+const int bdrLen = strlen(BOUNDARY);
+const int cntLen = strlen(CTNTTYPE);
+
+
+// ==== Memory allocator that takes advantage of PSRAM if present =======================
+char* allocateMemory(char* aPtr, size_t aSize) {
+
+  //  Since current buffer is too smal, free it
+  if (aPtr != NULL) free(aPtr);
+
+
+  size_t freeHeap = ESP.getFreeHeap();
+  char* ptr = NULL;
+
+  // If memory requested is more than 2/3 of the currently free heap, try PSRAM immediately
+  if ( aSize > freeHeap * 2 / 3 ) {
+    if ( psramFound() && ESP.getFreePsram() > aSize ) {
+      ptr = (char*) ps_malloc(aSize);
+    }
+  }
+  else {
+    //  Enough free heap - let's try allocating fast RAM as a buffer
+    ptr = (char*) malloc(aSize);
+
+    //  If allocation on the heap failed, let's give PSRAM one more chance:
+    if ( ptr == NULL && psramFound() && ESP.getFreePsram() > aSize) {
+      ptr = (char*) ps_malloc(aSize);
+    }
+  }
+
+  // Finally, if the memory pointer is NULL, we were not able to allocate any memory, and that is a terminal condition.
+  if (ptr == NULL) {
+    ESP.restart();
+  }
+  return ptr;
+}
 
 // ==== RTOS task to grab frames from the camera =========================
 void camCB(void* pvParameters) {
@@ -145,7 +115,7 @@ void camCB(void* pvParameters) {
   TickType_t xLastWakeTime;
 
   //  A running interval associated with currently desired frame rate
-  const TickType_t xFrequency = pdMS_TO_TICKS(1000 / FPS);
+  const TickType_t xFrequency = pdMS_TO_TICKS(1000 / Fps);
 
   // Mutex for the critical section of swithing the active frames around
   portMUX_TYPE xSemaphore = portMUX_INITIALIZER_UNLOCKED;
@@ -210,49 +180,6 @@ void camCB(void* pvParameters) {
 }
 
 
-// ==== Memory allocator that takes advantage of PSRAM if present =======================
-char* allocateMemory(char* aPtr, size_t aSize) {
-
-  //  Since current buffer is too smal, free it
-  if (aPtr != NULL) free(aPtr);
-
-
-  size_t freeHeap = ESP.getFreeHeap();
-  char* ptr = NULL;
-
-  // If memory requested is more than 2/3 of the currently free heap, try PSRAM immediately
-  if ( aSize > freeHeap * 2 / 3 ) {
-    if ( psramFound() && ESP.getFreePsram() > aSize ) {
-      ptr = (char*) ps_malloc(aSize);
-    }
-  }
-  else {
-    //  Enough free heap - let's try allocating fast RAM as a buffer
-    ptr = (char*) malloc(aSize);
-
-    //  If allocation on the heap failed, let's give PSRAM one more chance:
-    if ( ptr == NULL && psramFound() && ESP.getFreePsram() > aSize) {
-      ptr = (char*) ps_malloc(aSize);
-    }
-  }
-
-  // Finally, if the memory pointer is NULL, we were not able to allocate any memory, and that is a terminal condition.
-  if (ptr == NULL) {
-    ESP.restart();
-  }
-  return ptr;
-}
-
-
-// ==== STREAMING ======================================================
-const char HEADER[] = "HTTP/1.1 200 OK\r\n" \
-                      "Access-Control-Allow-Origin: *\r\n" \
-                      "Content-Type: multipart/x-mixed-replace; boundary=123456789000000000000987654321\r\n";
-const char BOUNDARY[] = "\r\n--123456789000000000000987654321\r\n";
-const char CTNTTYPE[] = "Content-Type: image/jpeg\r\nContent-Length: ";
-const int hdrLen = strlen(HEADER);
-const int bdrLen = strlen(BOUNDARY);
-const int cntLen = strlen(CTNTTYPE);
 
 
 // ==== Handle connection request from clients ===============================
@@ -293,7 +220,7 @@ void streamCB(void * pvParameters) {
   xLastWakeTime = xTaskGetTickCount();
   for (;;) {
     // Default assumption we are running according to the FPS
-    xFrequency = pdMS_TO_TICKS(1000 / FPS);
+    xFrequency = pdMS_TO_TICKS(1000 / Fps);
 
     //  Only bother to send anything if there is someone watching
     UBaseType_t activeClients = uxQueueMessagesWaiting(streamingClients);
@@ -379,6 +306,58 @@ void handleNotFound()
   server.send(200, "text / plain", message);
 }
 
+// ======== Server Connection Handler Task ==========================
+void mjpegCB(void* pvParameters) {
+  TickType_t xLastWakeTime;
+  const TickType_t xFrequency = pdMS_TO_TICKS(WSINTERVAL);
+
+  // Creating frame synchronization semaphore and initializing it
+  frameSync = xSemaphoreCreateBinary();
+  xSemaphoreGive( frameSync );
+
+  // Creating a queue to track all connected clients
+  streamingClients = xQueueCreate( 10, sizeof(WiFiClient*) );
+
+  //=== setup section  ==================
+
+  //  Creating RTOS task for grabbing frames from the camera
+  xTaskCreatePinnedToCore(
+    camCB,        // callback
+    "cam",        // name
+    4096,         // stacj size
+    NULL,         // parameters
+    2,            // priority
+    &tCam,        // RTOS task handle
+    APP_CPU);     // core
+
+  //  Creating task to push the stream to all connected clients
+  xTaskCreatePinnedToCore(
+    streamCB,
+    "strmCB",
+    4 * 1024,
+    NULL, //(void*) handler,
+    2,
+    &tStream,
+    APP_CPU);
+
+  //  Registering webserver handling routines
+  server.on("/mjpeg/1", HTTP_GET, handleJPGSstream);
+  server.on("/jpg", HTTP_GET, handleJPG);
+  server.onNotFound(handleNotFound);
+
+  //  Starting webserver
+  server.begin();
+
+  //=== loop() section  ===================
+  xLastWakeTime = xTaskGetTickCount();
+  for (;;) {
+    server.handleClient();
+
+    //  After every server client handling request, we let other tasks run and then pause
+    taskYIELD();
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
 
 
 // ==== SETUP method ==================================================================
@@ -413,11 +392,7 @@ void setup()
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
 
-  // Frame parameters: pick one
-  //  config.frame_size = FRAMESIZE_UXGA;
-  //  config.frame_size = FRAMESIZE_SVGA;
-  //  config.frame_size = FRAMESIZE_QVGA;
-  config.frame_size = FRAMESIZE_VGA;
+  config.frame_size = RESOLUTION;
   config.jpeg_quality = 12;
   config.fb_count = 2;
 
@@ -437,7 +412,7 @@ void setup()
   IPAddress ip;
 
   WiFi.mode(WIFI_STA);
-  WiFi.begin(SSID1, PWD1);
+  WiFi.begin(SSID, PWD);
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED)
   {
@@ -467,3 +442,4 @@ void setup()
 void loop() {
   vTaskDelay(1000);
 }
+
